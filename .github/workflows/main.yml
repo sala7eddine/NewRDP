@@ -1,4 +1,5 @@
-name: RDP
+name: RDP with Tailscale Auth Link
+
 on:
   workflow_dispatch:
 
@@ -8,65 +9,96 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Configure RDP
+      - name: Configure RDP (enable)
+        shell: pwsh
         run: |
-          Write-Host "== Enabling Remote Desktop =="
-
-          # تفعيل RDP وإيقاف المصادقة على مستوى الشبكة
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-
-          # فتح منفذ 3389 في الجدار الناري
+          Write-Host "== Enabling RDP =="
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
           netsh advfirewall firewall delete rule name="RDP Access" | Out-Null
           netsh advfirewall firewall add rule name="RDP Access" dir=in action=allow protocol=TCP localport=3389
 
-          # إعادة تشغيل الخدمة
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User
+      - name: Install Tailscale if missing
+        shell: pwsh
         run: |
-          Write-Host "== Creating RDP User =="
-
-          $Username = "runneruser"
-          $Password = "Pass@12345"
-          net user $Username $Password /add
-          net localgroup administrators $Username /add
-          net localgroup "Remote Desktop Users" $Username /add
-          Write-Host "User: $Username"
-          Write-Host "Password: $Password"
-
-      - name: Install Tailscale (if not present)
-        run: |
-          Write-Host "== Installing Tailscale (if not present) =="
-
-          if (-not (Get-Command "tailscale.exe" -ErrorAction SilentlyContinue)) {
-              $installerUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
-              $installer = "$env:TEMP\tailscale-setup.exe"
-              Write-Host "Downloading from $installerUrl"
-              Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing
-              Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+          Write-Host "== Install Tailscale if not present =="
+          # check existing command
+          if (Get-Command "tailscale.exe" -ErrorAction SilentlyContinue) {
+            Write-Host "tailscale.exe already available."
+            $tailscalePath = (Get-Command "tailscale.exe").Source
+            Write-Host "Using: $tailscalePath"
           } else {
-              Write-Host "Tailscale already installed."
+            $installerUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+            $installer = Join-Path $env:TEMP "tailscale-setup.exe"
+            Write-Host "Downloading $installerUrl ..."
+            Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing -ErrorAction Stop
+            Write-Host "Running installer..."
+            Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+            Start-Sleep -Seconds 5
+            # try to locate installed binary
+            $candidates = @(
+              "$env:ProgramFiles\Tailscale IPN\tailscale.exe",
+              "$env:ProgramFiles\Tailscale\tailscale.exe",
+              "$env:ProgramFiles(x86)\Tailscale IPN\tailscale.exe",
+              "$env:ProgramFiles(x86)\Tailscale\tailscale.exe"
+            )
+            $tailscalePath = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $tailscalePath) {
+              # fallback to PATH search
+              $cmd = Get-Command "tailscale.exe" -ErrorAction SilentlyContinue
+              if ($cmd) { $tailscalePath = $cmd.Source } else {
+                Write-Error "tailscale.exe not found after install."
+                exit 1
+              }
+            }
+            Write-Host "Tailscale binary: $tailscalePath"
           }
 
-      - name: Start Tailscale
+      - name: Run tailscale up and print auth URL
+        shell: pwsh
+        env:
+          TAILSCALE_PATH: ${{ steps.Install_Tailscale_if_missing.outputs.tailscalePath || '' }}
         run: |
-          Write-Host "== Starting Tailscale =="
-          Start-Process -FilePath "C:\Program Files\Tailscale\tailscale.exe" -ArgumentList "up --ssh" -Wait
-          Write-Host "Tailscale is now running. Use your account to connect."
+          Write-Host "== Running 'tailscale up' to obtain auth URL (interactive) =="
+          # find tailscale path (again, robust)
+          $paths = @(
+            "$env:ProgramFiles\Tailscale IPN\tailscale.exe",
+            "$env:ProgramFiles\Tailscale\tailscale.exe",
+            "$env:ProgramFiles(x86)\Tailscale IPN\tailscale.exe",
+            "$env:ProgramFiles(x86)\Tailscale\tailscale.exe"
+          )
+          $tailscaleExe = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $tailscaleExe) {
+            $cmd = Get-Command "tailscale.exe" -ErrorAction SilentlyContinue
+            if ($cmd) { $tailscaleExe = $cmd.Source }
+          }
+          if (-not $tailscaleExe) {
+            Write-Error "tailscale.exe not found. Aborting."
+            exit 1
+          }
+          Write-Host "Using: $tailscaleExe"
 
-      - name: Keep alive for 6 hours
-        run: |
-          Write-Host "RDP & Tailscale running. Keeping session alive..."
-          Start-Sleep -Seconds 21600
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          # Run with --accept-routes disabled to avoid prompting for extra permissions;
+          # do NOT pass --authkey so Tailscale prints an auth URL you can open.
+          $procInfo = & $tailscaleExe up --accept-routes=false 2>&1 | Tee-Object -Variable outLines
 
-          if ($addToAdministrators) {
-            Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          # print all output (for debugging)
+          $outLines | ForEach-Object { Write-Host $_ }
+
+          # try to find the URL line(s)
+          $urlLines = $outLines | Where-Object { $_ -match 'https://login.tailscale.com/[^\s]+' }
+          if ($urlLines) {
+            Write-Host "`n===== TAILSCALE AUTH URL(S) ====="
+            $urlLines | ForEach-Object { Write-Host $_ }
+            Write-Host "=================================`n"
+            Write-Host "Open one of the above URLs in your browser to Authorize this device (choose Windows/Linux etc in the Tailscale UI)."
+          } else {
+            Write-Host "No direct auth URL found in output. Check the full logs above. If you prefer automatic join, provide a TAILSCALE_AUTH_KEY secret and use '--authkey'."
           }
 
-          Write-Host "=== RDP CREDENTIALS ==="
-          Write-Host "Username: $username"
-          Write-Host "Password: $password"
-          Write-Host "======================="
+      - name: Keep job alive (for manual auth)
+        shell: pwsh
+        run: |
+          Write-Host "== Waiting 10 minutes for you to open the auth URL and authorize the device =="
+          # extend as needed; this keeps runner alive so you can complete Tailscale auth
+          Start-Sleep -Seconds 600
