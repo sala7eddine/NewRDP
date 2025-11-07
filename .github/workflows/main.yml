@@ -5,80 +5,13 @@ on:
 
 jobs:
   secure-rdp:
+    name: secure-rdp   # <-- هذا السطر يخلي الحالة تظهر بنفس الاسم بالضبط
     runs-on: windows-latest
     timeout-minutes: 3600
-    steps:
 
+    steps:
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
-
-          # Disable NLA (UserAuthentication) on the RDP listener (if you need to allow non-NLA connections)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
-
-          # Set SecurityLayer to 0 (RDP security layer) if required
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
-
-          # Remove any existing firewall rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule to delete"
-
-          # Allow incoming connections on port 3389 (RDP) for testing
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-
-          # Restart the Remote Desktop service to apply changes
           Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
-        shell: pwsh
-        run: |
-          # Configuration - change username or groups as needed
-          $username = 'RDPUserName'
-          $addToAdministrators = $false   # true إذا تبي تعطيه صلاحيات أدمِن (اختياري)
-          
-          # Build character sets
-          $upper = [char[]](65..90)   # A-Z
-          $lower = [char[]](97..122)  # a-z
-          $digits = [char[]](48..57)  # 0-9
-          $special = [char[]](33..47 + 58..64 + 91..96 + 123..126)
-          
-          # Ensure password complexity: at least 12 chars with all categories
-          $rnd = New-Object System.Random
-          $pwChars = @()
-          $pwChars += $upper[$rnd.Next(0,$upper.Length)]
-          $pwChars += $lower[$rnd.Next(0,$lower.Length)]
-          $pwChars += $digits[$rnd.Next(0,$digits.Length)]
-          $pwChars += $special[$rnd.Next(0,$special.Length)]
-          
-          # fill the rest randomly to reach length 16
-          $all = $upper + $lower + $digits + $special
-          1..12 | ForEach-Object { $pwChars += $all[$rnd.Next(0,$all.Length)] }
-          
-          # shuffle
-          $password = ($pwChars | Sort-Object {Get-Random}) -join ''
-          
-          # Create user if not exists
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            Write-Host "User $username already exists. Updating password."
-            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-            Set-LocalUser -Name $username -Password $securePass
-          } else {
-            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-            New-LocalUser -Name $username -Password $securePass -PasswordNeverExpires:$false -AccountNeverExpires:$false -UserMayNotChangePassword:$false -Description "RDP temporary user created by workflow"
-            Write-Host "User $username created."
-          }
-
-          # Add to Remote Desktop Users group
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
-
-          # Optionally add to Administrators
-          if ($addToAdministrators) {
-            Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
-          }
-
-          # Output credentials to job summary (masked). Note: GitHub will mask secrets but avoid printing in logs for production.
-          Write-Host "=== RDP CREDENTIALS ==="
-          Write-Host "Username: $username"
-          Write-Host "Password: $password"
-          Write-Host "======================="
