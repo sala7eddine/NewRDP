@@ -7,6 +7,9 @@ jobs:
   setup-rdp:
     runs-on: windows-latest
     timeout-minutes: 3600
+    env:
+      # اضبط secret في إعدادات الريبو (do NOT put raw key in file)
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
 
     steps:
       - name: Enable RDP and Firewall Rules
@@ -35,25 +38,85 @@ jobs:
           Write-Host "Username: $username"
           Write-Host "Password: $password"
           Write-Host "==================="
+          # خزّن القيم في متغيّر environment للوصول لها بخطوة لاحقة
           echo "USERNAME=$username" >> $env:GITHUB_ENV
           echo "PASSWORD=$password" >> $env:GITHUB_ENV
 
-      - name: Install and Connect Tailscale
+      - name: Install Tailscale (silent)
         shell: pwsh
         run: |
           Write-Host "== Installing Tailscale =="
           $installerUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
           $installer = "$env:TEMP\tailscale-setup.exe"
           Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing
-          Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+          Start-Process -FilePath $installer -ArgumentList "/S" -NoNewWindow -Wait
+          Write-Host "== Installer finished =="
+          Start-Sleep -Seconds 3
 
-          Write-Host "== Logging into Tailscale =="
-          tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname="github-rdp" --accept-routes=false
+      - name: Locate tailscale executable and start service if needed
+        shell: pwsh
+        run: |
+          # حاول المسار الافتراضي أول
+          $defaultPath = Join-Path -Path ${env:ProgramFiles} -ChildPath "Tailscale IPN\tailscale.exe"
+          $exe = $null
+          if (Test-Path $defaultPath) {
+            $exe = $defaultPath
+          } else {
+            # بحث سريع في Program Files و Program Files (x86)
+            $candidates = Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Recurse -Filter "tailscale.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($candidates) { $exe = $candidates.FullName }
+          }
 
-          Write-Host "== Getting IP Address =="
-          $ip = (tailscale ip -4)
-          echo "TS_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "Your Tailscale IP: $ip"
+          if (-not $exe) {
+            Write-Error "tailscale.exe not found after install. Listing Program Files for debugging."
+            Get-ChildItem 'C:\Program Files' -Depth 2 | Select-Object FullName | Out-String | Write-Host
+            exit 1
+          } else {
+            Write-Host "Found tailscale at: $exe"
+          }
+
+          # حاول تشغيل الخدمة لو موجودة، وإلا نكتفي باستدعاء الـ exe مباشرة
+          $svc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+          if ($svc) {
+            if ($svc.Status -ne 'Running') {
+              Start-Service -Name Tailscale
+              Start-Sleep -Seconds 2
+            }
+            Write-Host "Tailscale service status: $(Get-Service -Name Tailscale).Status"
+          }
+
+          # خزّن المسار لاستخدامه بعدين
+          echo "TAILSCALE_EXE=$exe" >> $env:GITHUB_ENV
+
+      - name: Login / up to Tailscale
+        shell: pwsh
+        run: |
+          $exe = $env:TAILSCALE_EXE
+          if (-not (Test-Path $exe)) {
+            Write-Error "tailscale executable missing: $exe"
+            exit 1
+          }
+
+          if (-not $env:TAILSCALE_AUTHKEY) {
+            Write-Error "No TAILSCALE_AUTHKEY provided. Set it in repo secrets."
+            exit 1
+          }
+
+          Write-Host "== Running: tailscale up =="
+          # استخدم authkey من env (لن يظهر في الـ logs لأنه سري)
+          & $exe up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="github-rdp" --accept-routes=false
+
+          # انتظر شوية عشان يثبت IP
+          Start-Sleep -Seconds 2
+
+          # جلب IP الخاص بـ Tailscale
+          $ip = (& $exe ip -4) -join " "
+          if ($ip) {
+            Write-Host "Tailscale IP: $ip"
+            echo "TS_IP=$ip" >> $env:GITHUB_ENV
+          } else {
+            Write-Warning "لم أحصل على IP من tailscale ip -4"
+          }
 
       - name: Display Connection Info
         shell: pwsh
@@ -61,10 +124,10 @@ jobs:
           Write-Host ""
           Write-Host "==============================="
           Write-Host "✅ RDP Setup Complete!"
-          Write-Host "IP Address: $env:TS_IP"
+          Write-Host "Tailscale IP: $env:TS_IP"
           Write-Host "Username: $env:USERNAME"
           Write-Host "Password: $env:PASSWORD"
           Write-Host "==============================="
           Write-Host ""
-          Write-Host "➡️  Open your Tailscale app and sign in with the same account you used."
-          Write-Host "➡️  Then connect to this IP using any RDP client from your phone."
+          Write-Host "➡️  افتح تطبيق Tailscale على جهازك وسجّل بنفس الحساب."
+          Write-Host "➡️  بعد كده افتح RDP للـ IP الظاهر فوق باستخدام بيانات الدخول."
