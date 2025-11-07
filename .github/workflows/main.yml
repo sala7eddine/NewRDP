@@ -1,110 +1,65 @@
 name: RDP
-
 on:
   workflow_dispatch:
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
-    steps:
+    timeout-minutes: 360
 
-      - name: Configure Core RDP Settings
-        shell: pwsh
+    steps:
+      - name: Configure RDP
         run: |
-          # Enable Remote Desktop
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule to delete"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Write-Host "== Enabling Remote Desktop =="
+
+          # تفعيل RDP وإيقاف المصادقة على مستوى الشبكة
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          # فتح منفذ 3389 في الجدار الناري
+          netsh advfirewall firewall delete rule name="RDP Access" | Out-Null
+          netsh advfirewall firewall add rule name="RDP Access" dir=in action=allow protocol=TCP localport=3389
+
+          # إعادة تشغيل الخدمة
           Restart-Service -Name TermService -Force
 
-      - name: Establish Tailscale Connection
-        shell: pwsh
+      - name: Create RDP User
+        run: |
+          Write-Host "== Creating RDP User =="
+
+          $Username = "runneruser"
+          $Password = "Pass@12345"
+          net user $Username $Password /add
+          net localgroup administrators $Username /add
+          net localgroup "Remote Desktop Users" $Username /add
+          Write-Host "User: $Username"
+          Write-Host "Password: $Password"
+
+      - name: Install Tailscale (if not present)
         run: |
           Write-Host "== Installing Tailscale (if not present) =="
-          $installerUrl = 'https://pkgs.tailscale.com/stable/tailscale-ipn-setup.exe'
-          $installer = Join-Path $env:TEMP 'tailscale-installer.exe'
 
-          # Download installer
-          Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing -ErrorAction Stop
-
-          # Run installer silently (will install Tailscale IPN)
-          Start-Process -FilePath $installer -ArgumentList '/quiet' -Wait
-
-          # Wait a moment for service & binary to be available
-          Start-Sleep -Seconds 5
-
-          # Ensure service is running (may be named 'Tailscale' / 'Tailscale IPN Service')
-          if (Get-Service -Name 'Tailscale' -ErrorAction SilentlyContinue) {
-            Start-Service -Name 'Tailscale' -ErrorAction SilentlyContinue
-          } elseif (Get-Service -Name 'Tailscale IPN Service' -ErrorAction SilentlyContinue) {
-            Start-Service -Name 'Tailscale IPN Service' -ErrorAction SilentlyContinue
-          }
-
-          # Path to tailscale binary (typical install location)
-          $tailscaleExe = Join-Path ${env:ProgramFiles} 'Tailscale IPN\tailscale.exe'
-          if (-Not (Test-Path $tailscaleExe)) {
-            # fallback: try plain Program Files\Tailscale\tailscale.exe
-            $tailscaleExe = Join-Path ${env:ProgramFiles} 'Tailscale\tailscale.exe'
-          }
-
-          if (-Not (Test-Path $tailscaleExe)) {
-            Write-Error "tailscale.exe not found after install. Aborting tailscale step."
-            exit 1
-          }
-
-          Write-Host "== Running 'tailscale up' to produce auth URL (if needed) =="
-          # Run tailscale up WITHOUT an auth key — this prints the "To authenticate, visit:" URL in output
-          $output = & $tailscaleExe up 2>&1 | Tee-Object -Variable out
-          # Print full output for visibility
-          $out | ForEach-Object { Write-Host $_ }
-
-          # Try to extract the auth URL line
-          $authLine = $out | Where-Object { $_ -match 'To authenticate, visit:' } 
-          if ($authLine) {
-            $index = ($out | Select-String -Pattern 'To authenticate, visit:' -SimpleMatch).LineNumber
-            # show next line(s) which often contain the URL
-            $maybeUrl = $out[$index]  # lines are 0-indexed in array
-            Write-Host "`n===== TAILSCALE AUTH URL ====="
-            Write-Host $maybeUrl
-            Write-Host "================================`n"
-            Write-Host "Open that URL in your browser to complete authentication."
+          if (-not (Get-Command "tailscale.exe" -ErrorAction SilentlyContinue)) {
+              $installerUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+              $installer = "$env:TEMP\tailscale-setup.exe"
+              Write-Host "Downloading from $installerUrl"
+              Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing
+              Start-Process -FilePath $installer -ArgumentList "/S" -Wait
           } else {
-            Write-Host "No interactive auth URL detected. If you prefer automatic join, use a Tailscale auth key."
+              Write-Host "Tailscale already installed."
           }
 
-      - name: Create RDP User with Secure Password
-        shell: pwsh
+      - name: Start Tailscale
         run: |
-          # Configuration - change username or groups as needed
-          $username = 'RDPUserName'
-          $addToAdministrators = $false
-          
-          $upper = [char[]](65..90)
-          $lower = [char[]](97..122)
-          $digits = [char[]](48..57)
-          $special = [char[]](33..47 + 58..64 + 91..96 + 123..126)
-          
-          $rnd = New-Object System.Random
-          $pwChars = @()
-          $pwChars += $upper[$rnd.Next(0,$upper.Length)]
-          $pwChars += $lower[$rnd.Next(0,$lower.Length)]
-          $pwChars += $digits[$rnd.Next(0,$digits.Length)]
-          $pwChars += $special[$rnd.Next(0,$special.Length)]
-          $all = $upper + $lower + $digits + $special
-          1..12 | ForEach-Object { $pwChars += $all[$rnd.Next(0,$all.Length)] }
-          $password = ($pwChars | Sort-Object {Get-Random}) -join ''
+          Write-Host "== Starting Tailscale =="
+          Start-Process -FilePath "C:\Program Files\Tailscale\tailscale.exe" -ArgumentList "up --ssh" -Wait
+          Write-Host "Tailscale is now running. Use your account to connect."
 
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-            Set-LocalUser -Name $username -Password $securePass
-          } else {
-            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-            New-LocalUser -Name $username -Password $securePass -PasswordNeverExpires:$false -AccountNeverExpires:$false -UserMayNotChangePassword:$false -Description "RDP temporary user created by workflow"
-          }
-
+      - name: Keep alive for 6 hours
+        run: |
+          Write-Host "RDP & Tailscale running. Keeping session alive..."
+          Start-Sleep -Seconds 21600
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
 
           if ($addToAdministrators) {
