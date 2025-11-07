@@ -1,104 +1,70 @@
-name: RDP with Tailscale Auth Link
+name: RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
+  setup-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 3600
 
     steps:
-      - name: Configure RDP (enable)
+      - name: Enable RDP and Firewall Rules
         shell: pwsh
         run: |
-          Write-Host "== Enabling RDP =="
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP Access" | Out-Null
-          netsh advfirewall firewall add rule name="RDP Access" dir=in action=allow protocol=TCP localport=3389
+          Write-Host "== Enabling Remote Desktop =="
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      - name: Install Tailscale if missing
+      - name: Create RDP User
         shell: pwsh
         run: |
-          Write-Host "== Install Tailscale if not present =="
-          # check existing command
-          if (Get-Command "tailscale.exe" -ErrorAction SilentlyContinue) {
-            Write-Host "tailscale.exe already available."
-            $tailscalePath = (Get-Command "tailscale.exe").Source
-            Write-Host "Using: $tailscalePath"
+          $username = "RDPUser"
+          $chars = ([char[]](33..126))
+          $password = -join ((1..14) | ForEach-Object { $chars | Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $username -Password $securePass
           } else {
-            $installerUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
-            $installer = Join-Path $env:TEMP "tailscale-setup.exe"
-            Write-Host "Downloading $installerUrl ..."
-            Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing -ErrorAction Stop
-            Write-Host "Running installer..."
-            Start-Process -FilePath $installer -ArgumentList "/S" -Wait
-            Start-Sleep -Seconds 5
-            # try to locate installed binary
-            $candidates = @(
-              "$env:ProgramFiles\Tailscale IPN\tailscale.exe",
-              "$env:ProgramFiles\Tailscale\tailscale.exe",
-              "$env:ProgramFiles(x86)\Tailscale IPN\tailscale.exe",
-              "$env:ProgramFiles(x86)\Tailscale\tailscale.exe"
-            )
-            $tailscalePath = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-            if (-not $tailscalePath) {
-              # fallback to PATH search
-              $cmd = Get-Command "tailscale.exe" -ErrorAction SilentlyContinue
-              if ($cmd) { $tailscalePath = $cmd.Source } else {
-                Write-Error "tailscale.exe not found after install."
-                exit 1
-              }
-            }
-            Write-Host "Tailscale binary: $tailscalePath"
+            New-LocalUser -Name $username -Password $securePass -FullName "RDP User" -Description "Temporary RDP user"
           }
 
-      - name: Run tailscale up and print auth URL
-        shell: pwsh
-        env:
-          TAILSCALE_PATH: ${{ steps.Install_Tailscale_if_missing.outputs.tailscalePath || '' }}
-        run: |
-          Write-Host "== Running 'tailscale up' to obtain auth URL (interactive) =="
-          # find tailscale path (again, robust)
-          $paths = @(
-            "$env:ProgramFiles\Tailscale IPN\tailscale.exe",
-            "$env:ProgramFiles\Tailscale\tailscale.exe",
-            "$env:ProgramFiles(x86)\Tailscale IPN\tailscale.exe",
-            "$env:ProgramFiles(x86)\Tailscale\tailscale.exe"
-          )
-          $tailscaleExe = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $tailscaleExe) {
-            $cmd = Get-Command "tailscale.exe" -ErrorAction SilentlyContinue
-            if ($cmd) { $tailscaleExe = $cmd.Source }
-          }
-          if (-not $tailscaleExe) {
-            Write-Error "tailscale.exe not found. Aborting."
-            exit 1
-          }
-          Write-Host "Using: $tailscaleExe"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          Write-Host "=== LOGIN INFO ==="
+          Write-Host "Username: $username"
+          Write-Host "Password: $password"
+          Write-Host "==================="
+          echo "USERNAME=$username" >> $env:GITHUB_ENV
+          echo "PASSWORD=$password" >> $env:GITHUB_ENV
 
-          # Run with --accept-routes disabled to avoid prompting for extra permissions;
-          # do NOT pass --authkey so Tailscale prints an auth URL you can open.
-          $procInfo = & $tailscaleExe up --accept-routes=false 2>&1 | Tee-Object -Variable outLines
-
-          # print all output (for debugging)
-          $outLines | ForEach-Object { Write-Host $_ }
-
-          # try to find the URL line(s)
-          $urlLines = $outLines | Where-Object { $_ -match 'https://login.tailscale.com/[^\s]+' }
-          if ($urlLines) {
-            Write-Host "`n===== TAILSCALE AUTH URL(S) ====="
-            $urlLines | ForEach-Object { Write-Host $_ }
-            Write-Host "=================================`n"
-            Write-Host "Open one of the above URLs in your browser to Authorize this device (choose Windows/Linux etc in the Tailscale UI)."
-          } else {
-            Write-Host "No direct auth URL found in output. Check the full logs above. If you prefer automatic join, provide a TAILSCALE_AUTH_KEY secret and use '--authkey'."
-          }
-
-      - name: Keep job alive (for manual auth)
+      - name: Install and Connect Tailscale
         shell: pwsh
         run: |
-          Write-Host "== Waiting 10 minutes for you to open the auth URL and authorize the device =="
-          # extend as needed; this keeps runner alive so you can complete Tailscale auth
-          Start-Sleep -Seconds 600
+          Write-Host "== Installing Tailscale =="
+          $installerUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          $installer = "$env:TEMP\tailscale-setup.exe"
+          Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing
+          Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+
+          Write-Host "== Logging into Tailscale =="
+          tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname="github-rdp" --accept-routes=false
+
+          Write-Host "== Getting IP Address =="
+          $ip = (tailscale ip -4)
+          echo "TS_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Your Tailscale IP: $ip"
+
+      - name: Display Connection Info
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "==============================="
+          Write-Host "✅ RDP Setup Complete!"
+          Write-Host "IP Address: $env:TS_IP"
+          Write-Host "Username: $env:USERNAME"
+          Write-Host "Password: $env:PASSWORD"
+          Write-Host "==============================="
+          Write-Host ""
+          Write-Host "➡️  Open your Tailscale app and sign in with the same account you used."
+          Write-Host "➡️  Then connect to this IP using any RDP client from your phone."
